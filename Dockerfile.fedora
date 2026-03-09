@@ -1,0 +1,195 @@
+ARG TRITON_VERSION=2.63.0
+ARG TRITON_BRANCH=r25.11
+ARG FEDORA_VERSION=42
+
+FROM fedora:${FEDORA_VERSION} AS tritonserver_buildbase
+
+ARG TRITON_BRANCH=r25.11
+ARG TRITON_VERSION=2.63.0
+
+LABEL stage="buildbase" \
+    triton.version="${TRITON_VERSION}" \
+    base.os="fedora:42"
+
+ENV TRITON_VERSION=${TRITON_VERSION}
+ENV PATH="/usr/local/bin:$PATH"
+
+RUN echo "install_weak_deps=False" >> /etc/dnf/dnf.conf && \
+    echo "tsflags=nodocs"          >> /etc/dnf/dnf.conf
+
+RUN dnf -y upgrade --refresh
+RUN dnf -y install \
+    \
+    gcc gcc-c++ make \
+    autoconf automake libtool \
+    git \
+    gperf \
+    pkgconf-pkg-config \
+    unzip wget ca-certificates \
+    \
+    # ── Python (cmake via pip — Fedora 42 ships 3.28, need 3.31+) ────────
+    # python3.13-devel: pybind11 ≥ 2.12 requires Python ≥ 3.12.3; Fedora 42
+    # ships python3.13 but /usr/bin/python3 may resolve to an older version.
+    # Installing python3.13-devel ensures headers + interpreter are present so
+    # PYTHON_EXECUTABLE can point cmake at it explicitly (see build.py call).
+    python3-devel python3-pip python3-wheel python3-setuptools \
+    python3.13-devel \
+    \
+    # ── Triton C++ dependencies ───────────────────────────────────────────
+    re2-devel \
+    openssl-devel \
+    openssl-libs \
+    libcurl \
+    libcurl-devel \
+    libb64-devel \
+    gperftools-devel \
+    rapidjson-devel \
+    zlib-devel \
+    libarchive-devel \
+    libxml2-devel \
+    numactl-devel \
+    libuuid-devel \
+    scons \
+    patchelf \
+    \
+    ninja-build \
+    nasm \
+    # c-ares-devel: gRPC DNS resolver headers (probed even when bundled)
+    c-ares-devel \
+    # golang      : gRPC configure invokes Go toolchain for protoc codegen
+    golang \
+    boost-devel \
+    libstdc++-static \
+    curl jq \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+ENV TRITON_SERVER_GPU_ENABLED=1
+
+
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir "cmake>=3.31,<4.0"
+
+RUN cmake --version | grep -E "^cmake version 3\.(3[1-9]|[4-9][0-9])" || \
+    { echo "ERROR: cmake < 3.31 — check pip install"; exit 1; }
+
+
+RUN pip3 install --no-cache-dir \
+    setuptools wheel docker numpy flake8 flatbuffers \
+    "patchelf==0.17.2" requests distro
+
+
+WORKDIR /workspace
+RUN mkdir server
+COPY . server
+
+# ── OpenSSL ENGINE compat stub 
+# OpenSSL 3.4 (Fedora 42) removed openssl/engine.h from openssl-devel.
+# Both gRPC and libcurl #include it; libcurl calls ENGINE_* functions without
+# OPENSSL_NO_ENGINE guards, so a stub that merely #define-s OPENSSL_NO_ENGINE
+# causes "implicit declaration" errors.  The full stub in cmake/ provides
+# inline no-ops for every ENGINE function so both libraries compile cleanly.
+RUN mkdir -p /usr/include/openssl && \
+    rm -f /usr/include/openssl/engine.h && \
+    cp /workspace/server/cmake/openssl_engine_stub.h /usr/include/openssl/engine.h
+
+# ── Build Triton
+# MAKEJOBS=1: sequential output so compile errors are immediately visible.
+# Change to 8 once confirmed working.
+ENV MAKEJOBS=1 \
+    BUILD_DIR=/tmp/tritonbuild \
+    INSTALL_DIR=/opt/tritonserver
+
+WORKDIR /workspace/server
+
+
+RUN python3 build.py \
+    --no-container-build \
+    --build-dir=${BUILD_DIR} \
+    --install-dir=${INSTALL_DIR} \
+    --enable-logging \
+    --enable-stats \
+    --enable-tracing \
+    --enable-metrics \
+    --endpoint=http \
+    --endpoint=grpc \
+    --backend=ensemble \
+    --backend=python \
+    --repo-tag=common:${TRITON_BRANCH} \
+    --repo-tag=core:${TRITON_BRANCH} \
+    --repo-tag=backend:${TRITON_BRANCH} \
+    --repo-tag=thirdparty:${TRITON_BRANCH} \
+    --build-type=Release \
+    --build-parallel=${MAKEJOBS} \
+    --extra-backend-cmake-arg python:PYTHON_EXECUTABLE=/usr/bin/python3.13 \
+    && echo "Build complete: ${INSTALL_DIR}" \
+    && rm -rf ${BUILD_DIR} /workspace/server
+
+#TODO: test only a single backend build
+# RUN python3 build.py \
+#     --no-container-build \
+#     --build-dir=${BUILD_DIR} \
+#     --install-dir=${INSTALL_DIR} \
+#     --enable-all \
+#     --filesystem s3 \
+#     --filesystem azure_storage \
+#     --repo-tag=common:${TRITON_BRANCH} \
+#     --repo-tag=core:${TRITON_BRANCH} \
+#     --repo-tag=backend:${TRITON_BRANCH} \
+#     --repo-tag=thirdparty:${TRITON_BRANCH} \
+#     --build-type=Release \
+#     --build-parallel=${MAKEJOBS} \
+#     --extra-backend-cmake-arg python:PYTHON_EXECUTABLE=/usr/bin/python3.13 \
+#     && echo "Build complete: ${INSTALL_DIR}" \
+#     && rm -rf ${BUILD_DIR} /workspace/server
+
+FROM fedora:${FEDORA_VERSION} AS tritonserver
+
+ARG TRITON_VERSION=2.63.0
+ARG FEDORA_VERSION=42
+
+LABEL org.opencontainers.image.title="Triton Inference Server (Fedora 42)" \
+    org.opencontainers.image.version="${TRITON_VERSION}" \
+    org.opencontainers.image.base.name="fedora:42"
+
+ENV TRITON_SERVER_VERSION=${TRITON_VERSION} \
+    PATH=/opt/tritonserver/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/tritonserver/lib:${LD_LIBRARY_PATH:-}
+
+RUN echo "install_weak_deps=False" >> /etc/dnf/dnf.conf && \
+    echo "tsflags=nodocs"          >> /etc/dnf/dnf.conf
+
+RUN dnf -y install \
+    openssl-libs \
+    libcurl \
+    libarchive \
+    zlib \
+    numactl-libs \
+    gperftools-libs \
+    python3 \
+    python3-pip \
+    curl jq \
+    \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir "numpy" grpcio protobuf
+
+COPY --from=tritonserver_buildbase /opt/tritonserver /opt/tritonserver
+
+RUN useradd --uid 1000 --gid 0 --no-create-home \
+    --shell /sbin/nologin triton && \
+    chown -R triton:root /opt/tritonserver && \
+    chmod -R g=u /opt/tritonserver
+
+RUN mkdir -p /models && chown triton:root /models && chmod g=u /models
+VOLUME ["/models"]
+
+EXPOSE 8000 8001 8002
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+    CMD curl -sf http://localhost:8000/v2/health/ready || exit 1
+
+USER triton
+WORKDIR /opt/tritonserver
+ENTRYPOINT ["tritonserver"]
+CMD ["--help"]

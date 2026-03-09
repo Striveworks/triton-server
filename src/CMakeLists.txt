@@ -38,20 +38,27 @@ include(GNUInstallDirs)
 #
 include(FetchContent)
 
+if(NOT TRITON_PATCH_SCRIPT)
+  set(TRITON_PATCH_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patch_core_libdir.cmake")
+endif()
+
 FetchContent_Declare(
   repo-common
   GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/common.git
   GIT_TAG ${TRITON_COMMON_REPO_TAG}
+  PATCH_COMMAND ${CMAKE_COMMAND} -P "${TRITON_PATCH_SCRIPT}"
 )
 FetchContent_Declare(
   repo-core
   GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
   GIT_TAG ${TRITON_CORE_REPO_TAG}
+  PATCH_COMMAND ${CMAKE_COMMAND} -P "${TRITON_PATCH_SCRIPT}"
 )
 FetchContent_Declare(
   repo-backend
   GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/backend.git
   GIT_TAG ${TRITON_BACKEND_REPO_TAG}
+  PATCH_COMMAND ${CMAKE_COMMAND} -P "${TRITON_PATCH_SCRIPT}"
 )
 
 if(TRITON_ENABLE_GRPC)
@@ -158,9 +165,10 @@ else()
 set(LIB_DIR "lib")
 if(LINUX)
   file(STRINGS "/etc/os-release" DISTRO_ID_LIKE REGEX "ID_LIKE")
-  if(${DISTRO_ID_LIKE} MATCHES "rhel|centos")
+  file(STRINGS "/etc/os-release" DISTRO_ID REGEX "^ID=")
+  if("${DISTRO_ID_LIKE}" MATCHES "rhel|centos|fedora" OR "${DISTRO_ID}" MATCHES "fedora")
     set (LIB_DIR "lib64")
-  endif(${DISTRO_ID_LIKE} MATCHES "rhel|centos")
+  endif()
 endif(LINUX)
 set(TRITON_CORE_HEADERS_ONLY OFF)
 

@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+
+ARG ROCKY_VERSION=9
+ARG NGC_VERSION=24.09
+ARG TRITON_VERSION=2.50.0
+
+FROM nvcr.io/nvidia/tritonserver:${NGC_VERSION}-py3 AS triton_extractor
+FROM docker.io/rockylinux/rockylinux:${ROCKY_VERSION} AS tritonserver
+
+ARG TRITON_VERSION=2.50.0
+
+LABEL org.opencontainers.image.title="Triton Inference Server (Rocky Linux 9, CPU)" \
+    org.opencontainers.image.description="CVE-reduced Rocky 9 Triton — CPU onnxruntime only, no GPU" \
+    org.opencontainers.image.version="${TRITON_VERSION}" \
+    org.opencontainers.image.base.name="rockylinux:9" \
+    triton.version="${TRITON_VERSION}"
+
+ENV TRITON_SERVER_VERSION=${TRITON_VERSION} \
+    PATH=/opt/tritonserver/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/tritonserver/lib:/usr/local/lib:/usr/local/lib64
+
+RUN echo "install_weak_deps=False" >> /etc/dnf/dnf.conf && \
+    echo "tsflags=nodocs"          >> /etc/dnf/dnf.conf
+
+# ── Runtime packages — no CUDA repo, no CUDA packages at all ─────────────────
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/var/lib/dnf \
+    dnf -y install epel-release dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf -y upgrade --refresh && \
+    dnf -y install \
+    re2 \
+    openssl-libs \
+    libarchive \
+    zlib \
+    numactl-libs \
+    gperftools-libs \
+    libxml2 \
+    python3 \
+    python3-pip \
+    jq \
+    && dnf -y install --allowerasing libcurl \
+    && dnf clean all
+
+RUN dnf -y upgrade curl-minimal libcurl-minimal && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --upgrade pip wheel && \
+    pip3 install "numpy<2" grpcio protobuf
+
+# ── Triton binary + core lib
+COPY --from=triton_extractor /opt/tritonserver/bin/tritonserver        /opt/tritonserver/bin/tritonserver
+COPY --from=triton_extractor /opt/tritonserver/lib/libtritonserver.so  /opt/tritonserver/lib/
+
+# ── Backends 
+COPY --from=triton_extractor /opt/tritonserver/backends/onnxruntime    /opt/tritonserver/backends/onnxruntime
+# COPY --from=triton_extractor /opt/tritonserver/backends/python         /opt/tritonserver/backends/python
+# COPY --from=triton_extractor /opt/tritonserver/backends/ensemble       /opt/tritonserver/backends/ensemble
+
+# ── libstdc++ 6.0.30 (Rocky 9 ships 6.0.29, NGC onnxruntime requires 6.0.30) -
+COPY --from=triton_extractor /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 /usr/lib64/
+
+# ── Entrypoint
+COPY --from=triton_extractor /opt/nvidia/entrypoint.d          /opt/nvidia/entrypoint.d
+COPY --from=triton_extractor /opt/nvidia/nvidia_entrypoint.sh  /opt/nvidia/nvidia_entrypoint.sh
+# tritonserver binary requires libcudart even for CPU-only mode
+COPY --from=triton_extractor \
+    /usr/local/cuda-12.6/targets/x86_64-linux/lib/libcudart.so.12 \
+    /usr/lib/x86_64-linux-gnu/libb64.so.0d \
+    /usr/lib/x86_64-linux-gnu/libdcgm.so.3 \
+    /usr/local/lib/
+# Missing runtime libs required by tritonserver binary even in CPU mode
+COPY --from=triton_extractor \
+    /usr/lib/x86_64-linux-gnu/libb64.so.0d \
+    /usr/lib/x86_64-linux-gnu/libdcgm.so.3 \
+    /usr/local/lib/
+
+COPY --from=triton_extractor \
+    /usr/local/cuda-12.6/targets/x86_64-linux/lib/libcupti.so.12 \
+    /usr/local/lib/
+RUN ln -sf /usr/lib64/libstdc++.so.6.0.30 /usr/lib64/libstdc++.so.6 && \
+    ldconfig
+
+RUN useradd --uid 1000 --gid 0 --no-create-home --shell /sbin/nologin triton && \
+    chown -R triton:root /opt/tritonserver && \
+    chmod -R g=u /opt/tritonserver && \
+    mkdir -p /models && \
+    chown triton:root /models && \
+    chmod g=u /models
+
+EXPOSE 8000 8001 8002
+
+USER triton
+WORKDIR /opt/tritonserver
+
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]

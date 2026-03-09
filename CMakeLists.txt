@@ -116,21 +116,25 @@ FetchContent_Declare(
   repo-core
   GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
   GIT_TAG ${TRITON_CORE_REPO_TAG}
+  PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_core_libdir.cmake"
 )
 FetchContent_Declare(
   repo-third-party
   GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/third_party.git
   GIT_TAG ${TRITON_THIRD_PARTY_REPO_TAG}
+  PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_core_libdir.cmake"
 )
 
 # Some libs are installed to ${TRITON_THIRD_PARTY_INSTALL_PREFIX}/{LIB}/lib64 instead
-# of ${TRITON_THIRD_PARTY_INSTALL_PREFIX}/{LIB}/lib on Centos
+# of ${TRITON_THIRD_PARTY_INSTALL_PREFIX}/{LIB}/lib on Centos/RHEL/Fedora.
+# Fedora has ID=fedora in /etc/os-release but no ID_LIKE field, so check both.
 set(LIB_DIR "lib")
 if(LINUX)
   file(STRINGS "/etc/os-release" DISTRO_ID_LIKE REGEX "ID_LIKE")
-  if(${DISTRO_ID_LIKE} MATCHES "rhel|centos")
-    set (LIB_DIR "lib64")
-  endif(${DISTRO_ID_LIKE} MATCHES "rhel|centos")
+  file(STRINGS "/etc/os-release" DISTRO_ID REGEX "^ID=")
+  if("${DISTRO_ID_LIKE}" MATCHES "rhel|centos|fedora" OR "${DISTRO_ID}" MATCHES "fedora")
+    set(LIB_DIR "lib64")
+  endif()
 endif(LINUX)
 set(TRITON_CORE_HEADERS_ONLY OFF)
 
@@ -216,7 +220,7 @@ ExternalProject_Add(triton-server
     ${_CMAKE_ARGS_CMAKE_TOOLCHAIN_FILE}
     ${_CMAKE_ARGS_VCPKG_TARGET_TRIPLET}
     -DGTEST_ROOT:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/googletest
-    -DgRPC_DIR:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/grpc/lib/cmake/grpc
+    -DgRPC_DIR:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/grpc/${LIB_DIR}/cmake/grpc
     -Dc-ares_DIR:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/c-ares/${LIB_DIR}/cmake/c-ares
     -Dre2_DIR:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/re2/${LIB_DIR}/cmake/re2
     -Dabsl_DIR:PATH=${TRITON_THIRD_PARTY_INSTALL_PREFIX}/absl/${LIB_DIR}/cmake/absl
@@ -265,5 +269,6 @@ ExternalProject_Add(triton-server
     -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
     -DCMAKE_INSTALL_PREFIX:PATH=${TRITON_INSTALL_PREFIX}
     -DTRITON_VERSION:STRING=${TRITON_VERSION}
+    -DTRITON_PATCH_SCRIPT:PATH=${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_core_libdir.cmake
   DEPENDS ${TRITON_DEPENDS}
 )

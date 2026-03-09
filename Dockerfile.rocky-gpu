@@ -1,0 +1,244 @@
+ARG TRITON_BRANCH=r24.09
+ARG TRITON_VERSION=2.50.0
+ARG ROCKY_VERSION=9
+ARG CUDA_VERSION=12-6
+ARG NGC_VERSION=24.09
+
+FROM nvcr.io/nvidia/tritonserver:${NGC_VERSION}-py3 AS triton_extractor
+
+# =============================================================================
+FROM docker.io/rockylinux/rockylinux:${ROCKY_VERSION} AS tritonserver_buildbase
+
+ARG TRITON_BRANCH=r24.09
+ARG TRITON_VERSION=2.50.0
+ARG CUDA_VERSION=12-6
+
+LABEL stage="buildbase" \
+    triton.version="${TRITON_VERSION}" \
+    base.os="rockylinux:9"
+
+ENV TRITON_VERSION=${TRITON_VERSION} \
+    CMAKE_BUILD_PARALLEL_LEVEL=8 \
+    CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+    CUDA_PATH=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:/usr/local/lib64 \
+    CMAKE_PREFIX_PATH=/usr/local \
+    BUILD_DIR=/tmp/tritonbuild \
+    INSTALL_DIR=/opt/tritonserver \
+    MAKEJOBS=32 \
+    BOOST_ROOT=/usr/local \
+    BOOST_INCLUDEDIR=/usr/local/include \
+    BOOST_LIBRARYDIR=/usr/local/lib
+
+RUN echo "install_weak_deps=False" >> /etc/dnf/dnf.conf && \
+    echo "tsflags=nodocs"          >> /etc/dnf/dnf.conf
+
+# ── Repos + upgrade + CUDA toolkit + cuDNN + build toolchain — single layer ──
+RUN dnf -y install epel-release dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf config-manager --add-repo \
+    https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo && \
+    dnf -y upgrade --refresh && \
+    dnf -y install \
+    cuda-toolkit-${CUDA_VERSION} \
+    cudnn9-cuda-12 && \
+    ln -sfn /usr/local/cuda-12.6 /usr/local/cuda && \
+    dnf -y install --allowerasing \
+    gcc gcc-c++ make which \
+    autoconf automake libtool \
+    git gperf \
+    pkgconf-pkg-config \
+    unzip wget ca-certificates \
+    python3.12-devel python3.12-pip python3.12-wheel python3-setuptools \
+    re2-devel \
+    openssl-devel \
+    libcurl-devel \
+    libb64-devel \
+    gperftools-devel \
+    rapidjson-devel \
+    zlib-devel \
+    libarchive-devel \
+    libxml2-devel \
+    numactl-devel \
+    libuuid-devel \
+    patchelf \
+    ninja-build \
+    curl jq \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    ln -sf /usr/bin/pip3.12 /usr/bin/pip3 && \
+    pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir \
+    "cmake>=3.26,<3.27" \
+    setuptools wheel \
+    "numpy<2" flatbuffers \
+    "patchelf==0.17.2" requests distro
+
+# ── Boost 1.82 from source (Rocky 9 ships 1.75, Triton requires ≥1.78) 
+ARG BOOST_VERSION=1.82.0
+ARG BOOST_VERSION_UNDERSCORE=1_82_0
+
+RUN curl -L --fail -o /tmp/boost.tar.gz \
+    https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.gz && \
+    tar -xzf /tmp/boost.tar.gz -C /tmp && \
+    cd /tmp/boost_${BOOST_VERSION_UNDERSCORE} && \
+    ./bootstrap.sh --prefix=/usr/local && \
+    ./b2 install -j$(nproc) && \
+    rm -rf /tmp/boost*
+
+# ── aws-sdk-cpp (S3/MinIO filesystem backend) 
+RUN git clone --recurse-submodules --depth 1 \
+    https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp && \
+    cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-sdk-cpp/build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_ONLY="s3;core;transfer" \
+    -DENABLE_TESTING=OFF \
+    -DAUTORUN_UNIT_TESTS=OFF \
+    -DCMAKE_PREFIX_PATH=/usr/local && \
+    cmake --build /tmp/aws-sdk-cpp/build --parallel $(nproc) && \
+    cmake --install /tmp/aws-sdk-cpp/build && \
+    rm -rf /tmp/aws-sdk-cpp
+
+# ── Clone Triton + inject NGC backends before build 
+WORKDIR /workspace
+RUN git clone --depth 1 --branch ${TRITON_BRANCH} \
+    https://github.com/triton-inference-server/server.git server
+
+# OnnxRuntime backend — prebuilt in Triton NGC image, GPU+cuDNN+TRT enabled
+COPY --from=triton_extractor \
+    /opt/tritonserver/backends/onnxruntime \
+    ${INSTALL_DIR}/backends/onnxruntime
+
+# TensorRT runtime libs (needed by onnxruntime TRT execution provider)
+COPY --from=triton_extractor \
+    /usr/lib/x86_64-linux-gnu/libnvinfer.so.10 \
+    /usr/lib/x86_64-linux-gnu/libnvinfer_plugin.so.10 \
+    /usr/lib/x86_64-linux-gnu/libnvinfer_lean.so.10 \
+    /usr/lib/x86_64-linux-gnu/libnvinfer_vc_plugin.so.10 \
+    /usr/lib/x86_64-linux-gnu/libnvinfer_dispatch.so.10 \
+    /usr/lib/x86_64-linux-gnu/libnvonnxparser.so.10 \
+    ${INSTALL_DIR}/lib/
+
+# ── OpenSSL 3.x compat + build Triton core 
+ENV CFLAGS="-Wno-implicit-function-declaration -DOPENSSL_API_COMPAT=0x10100000L -DOPENSSL_NO_ENGINE" \
+    CXXFLAGS="-DOPENSSL_API_COMPAT=0x10100000L -DOPENSSL_NO_ENGINE"
+
+WORKDIR /workspace/server
+RUN python3 build.py \
+    --no-container-build \
+    --build-dir=${BUILD_DIR} \
+    --install-dir=${INSTALL_DIR} \
+    --enable-logging \
+    --enable-stats \
+    --enable-metrics \
+    --enable-cpu-metrics \
+    --enable-tracing \
+    --enable-nvtx \
+    --enable-gpu \
+    --endpoint http \
+    --endpoint grpc \
+    --filesystem s3 \
+    --backend python \
+    --repo-tag=common:${TRITON_BRANCH} \
+    --repo-tag=core:${TRITON_BRANCH} \
+    --repo-tag=backend:${TRITON_BRANCH} \
+    --repo-tag=thirdparty:${TRITON_BRANCH} \
+    --build-type=Release \
+    --build-parallel=${MAKEJOBS} \
+    && echo "Triton build complete → ${INSTALL_DIR}" \
+    && rm -rf ${BUILD_DIR} /workspace/server
+
+
+FROM docker.io/rockylinux/rockylinux:${ROCKY_VERSION} AS tritonserver
+
+ARG TRITON_VERSION=2.50.0
+ARG CUDA_VERSION=12-6
+
+LABEL org.opencontainers.image.title="Triton Inference Server (Rocky Linux 9)" \
+    org.opencontainers.image.description="CVE-reduced Rocky 9 Triton — onnxruntime backend" \
+    org.opencontainers.image.version="${TRITON_VERSION}" \
+    org.opencontainers.image.base.name="rockylinux:9" \
+    triton.version="${TRITON_VERSION}"
+
+ENV TRITON_SERVER_VERSION=${TRITON_VERSION} \
+    PATH=/opt/tritonserver/bin:/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/tritonserver/lib:/usr/local/cuda/lib64:/usr/local/lib:/usr/local/lib64
+
+RUN echo "install_weak_deps=False" >> /etc/dnf/dnf.conf && \
+    echo "tsflags=nodocs"          >> /etc/dnf/dnf.conf
+
+# ── Repos + upgrade + all runtime packages — single layer
+RUN dnf -y install epel-release dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf config-manager --add-repo \
+    https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo && \
+    dnf -y upgrade --refresh && \
+    dnf -y install \
+    # CUDA runtime
+    cuda-cudart-${CUDA_VERSION} \
+    cuda-cupti-${CUDA_VERSION} \
+    libcublas-${CUDA_VERSION} \
+    libcurand-${CUDA_VERSION} \
+    libcufft-${CUDA_VERSION} \
+    libcusolver-${CUDA_VERSION} \
+    libcusparse-${CUDA_VERSION} \
+    cudnn9-cuda-12 \
+    # System runtime libs
+    re2 \
+    openssl-libs \
+    libarchive \
+    zlib \
+    numactl-libs \
+    gperftools-libs \
+    libxml2 \
+    python3 \
+    python3-pip \
+    jq \
+    && dnf -y install --allowerasing libcurl \
+    && ln -sfn /usr/local/cuda-12.6 /usr/local/cuda \
+    && dnf clean all && rm -rf /var/cache/dnf
+RUN dnf -y upgrade curl-minimal libcurl-minimal && \
+    dnf clean all && rm -rf /var/cache/dnf
+# ── Python runtime deps
+RUN pip3 install --no-cache-dir --upgrade pip wheel && \
+    pip3 install --no-cache-dir \
+    "numpy<2" \
+    grpcio \
+    protobuf
+
+# ── Triton install tree + AWS SDK libs 
+COPY --from=tritonserver_buildbase /opt/tritonserver              /opt/tritonserver
+COPY --from=tritonserver_buildbase /usr/local/lib/libaws*.so*     /usr/local/lib/
+COPY --from=tritonserver_buildbase /usr/local/lib/libs2n*.so*     /usr/local/lib/
+COPY --from=tritonserver_buildbase /usr/local/lib64/libaws*.so*   /usr/local/lib/
+COPY --from=tritonserver_buildbase /usr/local/lib64/libs2n*.so*   /usr/local/lib/
+
+
+COPY --from=triton_extractor /opt/nvidia/entrypoint.d        /opt/nvidia/entrypoint.d
+COPY --from=triton_extractor /opt/nvidia/nvidia_entrypoint.sh /opt/nvidia/nvidia_entrypoint.sh
+COPY --from=triton_extractor /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 /usr/lib64/
+
+RUN ln -sf /usr/lib64/libstdc++.so.6.0.30 /usr/lib64/libstdc++.so.6 && \
+    ldconfig
+
+RUN ldconfig
+
+
+RUN useradd --uid 1000 --gid 0 --no-create-home --shell /sbin/nologin triton && \
+    chown -R triton:root /opt/tritonserver && \
+    chmod -R g=u /opt/tritonserver && \
+    mkdir -p /models && \
+    chown triton:root /models && \
+    chmod g=u /models
+
+VOLUME ["/models"]
+EXPOSE 8000 8001 8002
+
+USER triton
+WORKDIR /opt/tritonserver
+
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
