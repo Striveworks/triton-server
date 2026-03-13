@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+
 
 ARG ROCKY_VERSION=9
 ARG NGC_VERSION=24.09
@@ -82,16 +82,16 @@ COPY --from=triton_extractor \
 RUN ln -sf /usr/lib64/libstdc++.so.6.0.30 /usr/lib64/libstdc++.so.6 && \
     ldconfig
 
-RUN useradd --uid 1000 --gid 0 --no-create-home --shell /sbin/nologin triton && \
-    chown -R triton:root /opt/tritonserver && \
+RUN useradd --uid 1001 --gid 0 --no-create-home --shell /sbin/nologin triton && \
+    chown -R 1001:root /opt/tritonserver && \
     chmod -R g=u /opt/tritonserver && \
     mkdir -p /models && \
-    chown triton:root /models && \
+    chown 1001:root /models && \
     chmod g=u /models
 
 EXPOSE 8000 8001 8002
 
-USER triton
+USER 1001
 WORKDIR /opt/tritonserver
 
 ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
